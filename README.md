@@ -1,2 +1,0 @@
-# ParaML
-Parallel Machine Learning
