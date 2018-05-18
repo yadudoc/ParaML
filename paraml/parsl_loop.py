@@ -1,76 +1,81 @@
-import threading
-import time
-from parsl import DataFlowKernel, App
-from localDockerIPP import localDockerIPP as config
+# Standard imports
+import argparse
+import pickle
+import zmq
+import logging
 
-dfk = DataFlowKernel(config=config)
+# Parsl imports
+import parsl
+from parsl.configs.local import localIPP as config
 
-@App('python', dfk)
-def hello(items):
-    return ["Hello {0}".format(item) for item in items]
+# Custom imports
+from app_catalog import APP_LOOKUP_TABLE
 
-@App('python', dfk)
-def increment(items):
-    return [item+1 for item in items]
+class ZmqServer(object):
+    """ Server
+    """
 
-def as_thread(fn):
+    def __init__(self, ip_address="*", port=5555):
+        context = zmq.Context(1)
+        self.server = context.socket(zmq.REP)
+        print("Starting server on {}:{}".format(ip_address, port))
+        self.server.bind("tcp://{}:{}".format(ip_address, port))
 
-    def run(*args, **kwargs):
-        kill_event = threading.Event()
-        kwargs['kill_event'] = kill_event
-        thread = threading.Thread(target=fn,
-                                  name=fn.__name__+".thread",
-                                  args=args,
-                                  kwargs=kwargs)
-        thread.start()
-        return thread, kill_event
+    def send(self, msg):
+        return self.server.send(msg)
 
-    return run
+    def recv(self):
+        return self.server.recv()
 
-#@as_thread
-def reply_loop(config, kill_event=None):
+
+def server(ip, port, logger):
     '''We have two loops, one that persistently listens for tasks
     and the other that waits for task completion and send results
     '''
-    while True:
-        print("[REPLY] sleeping")
-        try:
-            die = kill_event.wait(1)
-            if die:
-                print("[REPLY] got die message")
-                return
-        except Exception as e:
-            print("[REPLY] nothing so far", e)
+    parsl.load(config)
 
-#@as_thread
-def listen_loop(config, kill_event=None):
-    '''We have two loops, one that persistently listens for tasks
-    and the other that waits for task completion and send results
-    '''
-
+    server = ZmqServer(ip, port)
+    count = 0
     while True:
-        print("[LISTENER] sleeping")
-        try:
-            die = kill_event.wait(1)
-            if die:
-                print("[LISTENER] got die message")
-                return
-        except Exception as e:
-            print("[LISTENER] nothing so far", e)
+        msg = server.recv()
+        count+=1
+        (msg_type, task_id, task_inputs) =  pickle.loads(msg)
+        logger.debug("Requesting {} with {}".format(APP_LOOKUP_TABLE[task_id],
+                                                    task_inputs))
+        fut = APP_LOOKUP_TABLE[task_id](task_inputs)
+        reply = fut.result()
+        server.send(pickle.dumps(reply))
+
+        if count > 1000:
+            logger.debug("Flushing DFK tasks")
+            parsl.dfk().tasks = {}
+            count = 0
+
+class NullHandler(logging.Handler):
+    """Setup default logging to /dev/null since this is library."""
+
+    def emit(self, record):
+        pass
 
 if __name__ == "__main__" :
 
-    items = [ hello([i]) for i in range(0,10)]
-    print([i.result() for i in items])
-    #listen_loop()
-    exit(0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-p", "--port", default=5555, help="Port to launch the server on")
+    parser.add_argument("-i", "--interfaces", default="*", help="Interfaces to listen on")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args()
 
-    listener_thread, listener_kill_event = listen_loop({})
-    reply_thread, reply_kill_event = reply_loop({})
-    
-    time.sleep(4)
-    listener_kill_event.set()
-    listener_thread.join()
+    if args.debug:
+        logger = logging.getLogger("DLHub")
+        logger.setLevel(logging.DEBUG)
+        handler = logging.StreamHandler()
+        handler.setLevel(level)
+        formatter = logging.Formatter(format_string, datefmt='%Y-%m-%d %H:%M:%S')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    else:
+        logging.getLogger('DLHub').addHandler(NullHandler())
 
-    reply_kill_event.set()
-    reply_thread.join()
+    logger = logging.getLogger("DLHub")
+    logger.debug("Starting server")
+    server(args.interfaces, int(args.port), logger=logger)
